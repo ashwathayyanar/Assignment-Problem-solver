@@ -1,13 +1,9 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
-import path from 'path';
 import cors from 'cors';
-import { fileURLToPath } from 'url';
+
 import pool from './src/server/db.js';
 import { optimizeAllocations } from './src/server/optimizer.js';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -174,18 +170,7 @@ app.get('/api/stats', async (req, res) => {
   } catch (error: any) { res.status(500).json({ error: error.message }); }
 });
 
-// --- VITE & STATIC SERVING ---
-if (process.env.NODE_ENV !== 'production') {
-  (async () => {
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
-    app.use(vite.middlewares);
-    app.listen(PORT, '0.0.0.0', () => { console.log(`Server running on port ${PORT}`); });
-  })();
-} else {
-  const distPath = path.join(__dirname, 'dist');
-  app.use(express.static(distPath));
-  app.get('*', (req, res) => { res.sendFile(path.join(distPath, 'index.html')); });
-}
+
 
 // THIS IS CRITICAL FOR VERCEL TO WORK
 export default app;
