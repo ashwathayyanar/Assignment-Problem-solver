@@ -1,17 +1,20 @@
-import db from './db.js';
+import pool from './db.js'; // Ensure you are importing the default export (the pg pool) from your db file
 
-export function optimizeAllocations() {
+export async function optimizeAllocations() {
   // 1. Fetch pending jobs and available workers
-  const jobs = db.prepare("SELECT * FROM jobs WHERE status = 'pending' ORDER BY priority DESC, deadline ASC").all() as any[];
-  const workers = db.prepare('SELECT * FROM workers').all() as any[];
+  const jobsRes = await pool.query("SELECT * FROM jobs WHERE status = 'pending' ORDER BY priority DESC, deadline ASC");
+  const jobs = jobsRes.rows;
+  
+  const workersRes = await pool.query('SELECT * FROM workers');
+  const workers = workersRes.rows;
 
   const assignments = [];
   const logs = [];
 
-  // Reset current loads for simplicity in this run (in a real app, we'd calculate based on active assignments)
-  db.prepare('UPDATE workers SET current_load = 0').run();
-  db.prepare('DELETE FROM assignments').run();
-  db.prepare("UPDATE jobs SET status = 'pending'").run();
+  // Reset current loads for simplicity in this run
+  await pool.query('UPDATE workers SET current_load = 0');
+  await pool.query('DELETE FROM assignments');
+  await pool.query("UPDATE jobs SET status = 'pending'");
 
   // 2. Greedy matching algorithm
   for (const job of jobs) {
@@ -63,11 +66,14 @@ export function optimizeAllocations() {
       // Make assignment
       bestWorker.current_load += job.complexity;
       
-      const stmt = db.prepare('INSERT INTO assignments (job_id, worker_id, score, reasoning) VALUES (?, ?, ?, ?)');
-      stmt.run(job.id, bestWorker.id, bestScore, bestReasoning);
+      // Changed to async PostgreSQL queries with $1, $2 parameters
+      await pool.query(
+        'INSERT INTO assignments (job_id, worker_id, score, reasoning) VALUES ($1, $2, $3, $4)',
+        [job.id, bestWorker.id, bestScore, bestReasoning]
+      );
       
-      db.prepare("UPDATE jobs SET status = 'assigned' WHERE id = ?").run(job.id);
-      db.prepare('UPDATE workers SET current_load = ? WHERE id = ?').run(bestWorker.current_load, bestWorker.id);
+      await pool.query("UPDATE jobs SET status = 'assigned' WHERE id = $1", [job.id]);
+      await pool.query('UPDATE workers SET current_load = $1 WHERE id = $2', [bestWorker.current_load, bestWorker.id]);
 
       assignments.push({
         jobId: job.id,
