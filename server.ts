@@ -3,7 +3,7 @@ import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import cors from 'cors';
 import { fileURLToPath } from 'url';
-import db from './src/server/db.js';
+import pool from './src/server/db.js'; // Using the pool from your pg config
 import { optimizeAllocations } from './src/server/optimizer.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -11,7 +11,7 @@ const __dirname = path.dirname(__filename);
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000; // Good practice for cloud deployments like Vercel
 
   app.use(cors());
   app.use(express.json());
@@ -22,29 +22,53 @@ async function startServer() {
   });
 
   // Jobs
-  app.get('/api/jobs', (req, res) => {
-    const jobs = db.prepare('SELECT * FROM jobs').all();
-    res.json(jobs);
-  });
-
-  app.post('/api/jobs', (req, res) => {
-    const { title, required_skill, complexity, deadline, priority } = req.body;
-    const stmt = db.prepare('INSERT INTO jobs (title, required_skill, complexity, deadline, priority, status) VALUES (?, ?, ?, ?, ?, ?)');
-    const info = stmt.run(title, required_skill, complexity, deadline, priority, 'pending');
-    res.json({ id: info.lastInsertRowid });
-  });
-
-  app.delete('/api/jobs/:id', (req, res) => {
+  // Note: Route handlers are now async
+  app.get('/api/jobs', async (req, res) => {
     try {
-      const assignment = db.prepare('SELECT * FROM assignments WHERE job_id = ?').get(req.params.id) as any;
+      const result = await pool.query('SELECT * FROM jobs');
+      res.json(result.rows);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post('/api/jobs', async (req, res) => {
+    try {
+      const { title, required_skill, complexity, deadline, priority } = req.body;
+      // PostgreSQL uses $1, $2 and RETURNING id instead of lastInsertRowid
+      const query = `
+        INSERT INTO jobs (title, required_skill, complexity, deadline, priority, status) 
+        VALUES ($1, $2, $3, $4, $5, $6) 
+        RETURNING id
+      `;
+      const result = await pool.query(query, [title, required_skill, complexity, deadline, priority, 'pending']);
+      res.json({ id: result.rows[0].id });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.delete('/api/jobs/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      const assignRes = await pool.query('SELECT * FROM assignments WHERE job_id = $1', [id]);
+      const assignment = assignRes.rows[0];
+      
       if (assignment) {
-        const job = db.prepare('SELECT complexity FROM jobs WHERE id = ?').get(req.params.id) as any;
+        const jobRes = await pool.query('SELECT complexity FROM jobs WHERE id = $1', [id]);
+        const job = jobRes.rows[0];
+        
         if (job) {
-          db.prepare('UPDATE workers SET current_load = MAX(0, current_load - ?) WHERE id = ?').run(job.complexity, assignment.worker_id);
+          // PostgreSQL uses GREATEST instead of SQLite's MAX for scalar comparison
+          await pool.query(
+            'UPDATE workers SET current_load = GREATEST(0, current_load - $1) WHERE id = $2',
+            [job.complexity, assignment.worker_id]
+          );
         }
-        db.prepare('DELETE FROM assignments WHERE job_id = ?').run(req.params.id);
+        await pool.query('DELETE FROM assignments WHERE job_id = $1', [id]);
       }
-      db.prepare('DELETE FROM jobs WHERE id = ?').run(req.params.id);
+      await pool.query('DELETE FROM jobs WHERE id = $1', [id]);
       res.json({ success: true });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -52,26 +76,42 @@ async function startServer() {
   });
 
   // Workers
-  app.get('/api/workers', (req, res) => {
-    const workers = db.prepare('SELECT * FROM workers').all();
-    res.json(workers);
-  });
-
-  app.post('/api/workers', (req, res) => {
-    const { name, skill, experience, capacity } = req.body;
-    const stmt = db.prepare('INSERT INTO workers (name, skill, experience, capacity, current_load) VALUES (?, ?, ?, ?, ?)');
-    const info = stmt.run(name, skill, experience, capacity, 0);
-    res.json({ id: info.lastInsertRowid });
-  });
-
-  app.delete('/api/workers/:id', (req, res) => {
+  app.get('/api/workers', async (req, res) => {
     try {
-      const assignments = db.prepare('SELECT * FROM assignments WHERE worker_id = ?').all(req.params.id) as any[];
+      const result = await pool.query('SELECT * FROM workers');
+      res.json(result.rows);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post('/api/workers', async (req, res) => {
+    try {
+      const { name, skill, experience, capacity } = req.body;
+      const query = `
+        INSERT INTO workers (name, skill, experience, capacity, current_load) 
+        VALUES ($1, $2, $3, $4, $5) 
+        RETURNING id
+      `;
+      const result = await pool.query(query, [name, skill, experience, capacity, 0]);
+      res.json({ id: result.rows[0].id });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.delete('/api/workers/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const assignRes = await pool.query('SELECT * FROM assignments WHERE worker_id = $1', [id]);
+      const assignments = assignRes.rows;
+      
       for (const a of assignments) {
-        db.prepare("UPDATE jobs SET status = 'pending' WHERE id = ?").run(a.job_id);
+        await pool.query("UPDATE jobs SET status = 'pending' WHERE id = $1", [a.job_id]);
       }
-      db.prepare('DELETE FROM assignments WHERE worker_id = ?').run(req.params.id);
-      db.prepare('DELETE FROM workers WHERE id = ?').run(req.params.id);
+      
+      await pool.query('DELETE FROM assignments WHERE worker_id = $1', [id]);
+      await pool.query('DELETE FROM workers WHERE id = $1', [id]);
       res.json({ success: true });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -79,20 +119,25 @@ async function startServer() {
   });
 
   // Assignments
-  app.get('/api/assignments', (req, res) => {
-    const assignments = db.prepare(`
-      SELECT a.*, j.title as job_title, w.name as worker_name 
-      FROM assignments a
-      JOIN jobs j ON a.job_id = j.id
-      JOIN workers w ON a.worker_id = w.id
-    `).all();
-    res.json(assignments);
+  app.get('/api/assignments', async (req, res) => {
+    try {
+      const result = await pool.query(`
+        SELECT a.*, j.title as job_title, w.name as worker_name 
+        FROM assignments a
+        JOIN jobs j ON a.job_id = j.id
+        JOIN workers w ON a.worker_id = w.id
+      `);
+      res.json(result.rows);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
   });
 
   // Optimization Engine
-  app.post('/api/optimize', (req, res) => {
+  app.post('/api/optimize', async (req, res) => {
     try {
-      const results = optimizeAllocations();
+      // optimizeAllocations is now async, so we await it
+      const results = await optimizeAllocations();
       res.json(results);
     } catch (error: any) {
       console.error('Optimization error:', error);
@@ -101,22 +146,22 @@ async function startServer() {
   });
 
   // Reset & Clear
-  app.post('/api/reset', (req, res) => {
+  app.post('/api/reset', async (req, res) => {
     try {
-      db.prepare('DELETE FROM assignments').run();
-      db.prepare("UPDATE jobs SET status = 'pending'").run();
-      db.prepare('UPDATE workers SET current_load = 0').run();
+      await pool.query('DELETE FROM assignments');
+      await pool.query("UPDATE jobs SET status = 'pending'");
+      await pool.query('UPDATE workers SET current_load = 0');
       res.json({ success: true });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
   });
 
-  app.post('/api/clear', (req, res) => {
+  app.post('/api/clear', async (req, res) => {
     try {
-      db.prepare('DELETE FROM assignments').run();
-      db.prepare('DELETE FROM jobs').run();
-      db.prepare('DELETE FROM workers').run();
+      await pool.query('DELETE FROM assignments');
+      await pool.query('DELETE FROM jobs');
+      await pool.query('DELETE FROM workers');
       res.json({ success: true });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -124,13 +169,23 @@ async function startServer() {
   });
 
   // Dashboard Stats
-  app.get('/api/stats', (req, res) => {
-    const totalJobs = (db.prepare('SELECT COUNT(*) as count FROM jobs').get() as any).count;
-    const pendingJobs = (db.prepare("SELECT COUNT(*) as count FROM jobs WHERE status = 'pending'").get() as any).count;
-    const totalWorkers = (db.prepare('SELECT COUNT(*) as count FROM workers').get() as any).count;
-    const activeAssignments = (db.prepare('SELECT COUNT(*) as count FROM assignments').get() as any).count;
-    
-    res.json({ totalJobs, pendingJobs, totalWorkers, activeAssignments });
+  app.get('/api/stats', async (req, res) => {
+    try {
+      // PostgreSQL COUNT returns a string, so we parseInt
+      const totalJobsRes = await pool.query('SELECT COUNT(*) as count FROM jobs');
+      const pendingJobsRes = await pool.query("SELECT COUNT(*) as count FROM jobs WHERE status = 'pending'");
+      const totalWorkersRes = await pool.query('SELECT COUNT(*) as count FROM workers');
+      const activeAssignmentsRes = await pool.query('SELECT COUNT(*) as count FROM assignments');
+
+      res.json({ 
+        totalJobs: parseInt(totalJobsRes.rows[0].count, 10), 
+        pendingJobs: parseInt(pendingJobsRes.rows[0].count, 10), 
+        totalWorkers: parseInt(totalWorkersRes.rows[0].count, 10), 
+        activeAssignments: parseInt(activeAssignmentsRes.rows[0].count, 10) 
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
   });
 
   // Vite middleware for development
@@ -149,7 +204,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Server running on port ${PORT}`);
   });
 }
 
